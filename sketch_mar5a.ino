@@ -3,228 +3,324 @@
 #include <vector>
 #include <PubSubClient.h>
 #include <DHT.h>
-#include <HTTPClient.h>   // Sửa lỗi 'HTTPClient' was not declared
-#include <ArduinoJson.h>  // Thư viện để xử lý JSON
-const char* ssid = "Quan Quyen Luong";
-const char* password = "1593572486";
-const char* mqtt_server = "192.168.1.122";  // IP máy chạy NestJS
-const int mqtt_port = 1883;
-struct Property {
-  const char* key;
-  float value;
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// ==========================================
+// 1. ĐỊNH NGHĨA CẤU TRÚC VÀ TÀI NGUYÊN
+// ==========================================
+
+// Cấu trúc dữ liệu để truyền qua Queue (Hàng đợi)
+struct SensorMessage {
+  String id;
+  String roomId;
+  float temp;
+  float humid;
+  float analog;
+  String type;
 };
 
-// Cấu trúc mở rộng để chứa con trỏ tới Object DHT
 struct SensorConfig {
   int gipo;
   String id;
   String roomId;
   String type;
-  float lastValue = -1.0;   // Để so sánh 10%
-  DHT* dhtInstance = NULL;  // Con trỏ quản lý đối tượng DHT
+  DHT* dhtInstance = NULL;
 };
 
 struct DeviceConfig {
   int gipo;
-  String roomId;
   String id;
+  String roomId;
   bool status;
-  int value;
 };
 
+// Tài nguyên FreeRTOS
+QueueHandle_t sensorQueue;         // Hàng đợi cho dữ liệu cảm biến
+SemaphoreHandle_t deviceMutex;     // Mutex bảo vệ danh sách thiết bị
+EventGroupHandle_t networkEvents;  // Nhóm sự kiện kết nối
+const int WIFI_BIT = BIT0;
+const int MQTT_BIT = BIT1;
+
+// Danh sách lưu trữ (Shared Resources)
 std::vector<DeviceConfig> deviceList;
 std::vector<SensorConfig> sensorList;
-std::map<String, std::vector<Property>> sensorMap;
+std::map<String, float> lastValues;  // Để so sánh 10%
+
+// Cấu hình mạng
+const char* ssid = "Quan Quyen Luong";
+const char* password = "1593572486";
+const char* mqtt_server = "192.168.1.122";
+
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-bool isSignificantChange(float oldValue, float newValue) {
-  if (oldValue == 0) return newValue != 0;  // Tránh chia cho 0
-  float diff = fabs(newValue - oldValue);
-  return (diff / fabs(oldValue)) >= 0.10;  // Trả về true nếu lệch >= 10%
-}
-void processSensorData(SensorConfig sensor, std::vector<Property> newData) {
-  bool shouldSend = false;
+// ==========================================
+// 2. CÁC TASK CHỨC NĂNG
+// ==========================================
 
-  // 1. Kiểm tra xem sensor này đã từng có dữ liệu chưa
-  if (sensorMap.count(sensor.id)) {
-    std::vector<Property>& lastData = sensorMap[sensor.id];
+// TASK 1: Quản lý kết nối (Chạy trên Core 0 - Ưu tiên cao)
+void vTaskNetwork(void *pvParameters) {
+  for (;;) {
+    // 1. Kiểm tra WiFi
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[NET] WiFi Lost. Reconnecting...");
+      xEventGroupClearBits(networkEvents, WIFI_BIT);
+      WiFi.begin(ssid, password);
+      
+      int retry = 0;
+      while (WiFi.status() != WL_CONNECTED && retry < 20) {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        retry++;
+      }
+    } else {
+      xEventGroupSetBits(networkEvents, WIFI_BIT);
+    }
 
-    // Duyệt qua các thuộc tính mới nhận được
-    for (auto& newProp : newData) {
-      for (auto& oldProp : lastData) {
-        if (newProp.key == oldProp.key) {
-          if (isSignificantChange(oldProp.value, newProp.value)) {
-            shouldSend = true;
-            oldProp.value = newProp.value;  // Cập nhật giá trị cũ bằng giá trị mới
-          }
+    // 2. Kiểm tra MQTT (Chỉ khi WiFi đã OK)
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!client.connected()) {
+        Serial.println("[NET] MQTT Connecting...");
+        xEventGroupClearBits(networkEvents, MQTT_BIT);
+        
+        // Thêm ID duy nhất để tránh bị Broker đá ra
+        String clientId = "ESP32_HVKTMM_" + String(random(0, 9999));
+        if (client.connect(clientId.c_str())) {
+          Serial.println("[NET] MQTT Connected!");
+          client.subscribe("devices/control");
+          xEventGroupSetBits(networkEvents, MQTT_BIT);
+        } else {
+          Serial.printf("[NET] MQTT Failed, rc=%d. Retry in 5s\n", client.state());
+          vTaskDelay(5000 / portTICK_PERIOD_MS);
         }
+      } else {
+        client.loop(); // Phải có để giữ kết nối
       }
     }
-  } else {
-    // Lần đầu tiên nhận dữ liệu từ Sensor này
-    sensorMap[sensor.id] = newData;
-    shouldSend = true;
-  }
-
-  // 2. Nếu có bất kỳ sự thay đổi nào > 10%, gửi MQTT
-  if (shouldSend) {
-    sendMqtt(sensor, sensorMap[sensor.id]);
+    vTaskDelay(100 / portTICK_PERIOD_MS); 
   }
 }
-void sendMqtt(SensorConfig sensor, std::vector<Property> data) {
+
+// TASK 2: Thu thập dữ liệu cảm biến (Chạy trên Core 1)
+void vTaskSensorCollector(void* pvParameters) {
+  for (;;) {
+    for (auto& s : sensorList) {
+      SensorMessage msg;
+      msg.id = s.id;
+      msg.roomId = s.roomId;
+      msg.type = s.type;
+
+      if (s.type == "DHT11" && s.dhtInstance != NULL) {
+        msg.temp = s.dhtInstance->readTemperature();
+        msg.humid = s.dhtInstance->readHumidity();
+        Serial.printf("[SENSOR] %s -> Temp: %.2f | Humid: %.2f\n",
+                      msg.id.c_str(), msg.temp, msg.humid);
+
+      } else {
+        msg.analog = (float)analogRead(s.gipo);
+        Serial.printf("[SENSOR] %s -> Analog: %.2f\n",
+                      msg.id.c_str(), msg.analog);
+      }
+
+      // Đẩy vào Queue, nếu hàng đợi đầy thì bỏ qua (non-blocking)
+      xQueueSend(sensorQueue, &msg, 0);
+    }
+    vTaskDelay(10000 / portTICK_PERIOD_MS);  // Đọc mỗi 10 giây
+  }
+}
+
+// TASK 3: Xử lý và gửi dữ liệu MQTT (Chạy trên Core 1)
+void vTaskMQTTProcessor(void* pvParameters) {
+  SensorMessage received;
+  for (;;) {
+    // Đợi cho đến khi có mạng và có dữ liệu trong Queue
+    if (xQueueReceive(sensorQueue, &received, portMAX_DELAY) == pdPASS) {
+      Serial.printf("[MQTT] Processing sensor: %s\n", received.id.c_str());
+      // Kiểm tra xem có mạng không trước khi xử lý logic nặng
+      EventBits_t bits = xEventGroupGetBits(networkEvents);
+      if ((bits & (WIFI_BIT | MQTT_BIT)) == (WIFI_BIT | MQTT_BIT)) {
+
+        Serial.printf("[MQTT] Processing: %s\n", received.id.c_str());
+        // ... (Giữ nguyên logic so sánh 10% của bạn) ...
+
+        float currentVal = (received.type == "DHT11") ? received.temp : received.analog;
+
+        // Logic so sánh 10% (Chống spam Broker)
+        bool changed = false;
+        if (lastValues.find(received.id) == lastValues.end()) {
+          changed = true;
+        } else {
+          float oldVal = lastValues[received.id];
+          if (oldVal == 0 || (fabs(currentVal - oldVal) / fabs(oldVal)) >= 0.10) changed = true;
+        }
+
+        if (changed && !isnan(currentVal)) {
+          lastValues[received.id] = currentVal;
+
+          StaticJsonDocument<256> doc;
+          doc["sensorId"] = received.id;
+          doc["roomId"] = received.roomId;
+          JsonObject cur = doc.createNestedObject("current");
+          if (received.type == "DHT11") {
+            cur["temperature"] = received.temp;
+            cur["humidity"] = received.humid;
+          } else {
+            cur["analog"] = received.analog;
+          }
+
+          char buffer[256];
+          serializeJson(doc, buffer);
+          client.publish("sensors/temp", buffer);
+          Serial.printf("[MQTT] Published %s\n", received.id.c_str());
+        }
+      } else {
+        Serial.println("[MQTT] Skip publish - Network down");
+      }
+    }
+  }
+}
+
+// TASK 4: Giám sát hệ thống (System Health)
+void vTaskMonitor(void* pvParameters) {
+  for (;;) {
+    Serial.println("\n--- SYSTEM MONITOR ---");
+    Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("Queue Messages: %u\n", uxQueueMessagesWaiting(sensorQueue));
+    Serial.printf("Min Free Stack (MQTT): %u words\n", uxTaskGetStackHighWaterMark(NULL));
+    Serial.println("----------------------");
+    vTaskDelay(20000 / portTICK_PERIOD_MS);
+  }
+}
+
+// ==========================================
+// 3. CALLBACK & SETUP
+// ==========================================
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  // 1. Theo dõi dữ liệu thô nhận được từ Broker
+  Serial.println("\n--- [MQTT CALLBACK] New Message ---");
+  Serial.printf("Topic: %s\n", topic);
+  
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.printf("Payload: %s\n", message.c_str());
+
+  // 2. Giải mã JSON
   StaticJsonDocument<256> doc;
-  doc["sensorId"] = sensor.id;
-  doc["roomId"] = sensor.roomId;
+  DeserializationError error = deserializeJson(doc, payload, length);
 
-  JsonObject values = doc.createNestedObject("current");
-
-  for (const auto& prop : data) {
-    values[prop.key] = prop.value;
+  if (error) {
+    Serial.printf("[ERROR] JSON Deserialization failed: %s\n", error.c_str());
+    return;
   }
 
-  char buffer[256];
-  serializeJson(doc, buffer);
-  client.publish("sensors/temp", buffer);
-  Serial.print("MQTT Sent: ");
-  Serial.println(buffer);
+  // Lấy dữ liệu từ JSON
+  String targetId = doc["id"] | "Unknown";
+  bool newStatus = doc["status"] | false;
+  
+  Serial.printf("[DEBUG] Parsed - ID: %s, Requested Status: %s\n", 
+                targetId.c_str(), newStatus ? "ON" : "OFF");
+
+  // 3. Quá trình xử lý thiết bị với Mutex
+  if (xSemaphoreTake(deviceMutex, portMAX_DELAY) == pdTRUE) {
+    bool deviceFound = false;
+    
+    for (auto& d : deviceList) {
+      if (d.id == targetId) {
+        d.status = newStatus;
+        digitalWrite(d.gipo, d.status ? HIGH : LOW);
+        
+        Serial.printf("[SUCCESS] Switched Device %s (GPIO %d) to %s\n", 
+                      d.id.c_str(), d.gipo, d.status ? "ON" : "OFF");
+        deviceFound = true;
+        break;
+      }
+    }
+
+    if (!deviceFound) {
+      Serial.printf("[WARN] Device ID '%s' not found in deviceList!\n", targetId.c_str());
+    }
+
+    xSemaphoreGive(deviceMutex);
+  } else {
+    Serial.println("[ERROR] Could not acquire Mutex to control device!");
+  }
+  
+  Serial.println("-----------------------------------\n");
 }
 
 void setup() {
   Serial.begin(115200);
+
+  // Khởi tạo tài nguyên OS
+  sensorQueue = xQueueCreate(20, sizeof(SensorMessage));
+  deviceMutex = xSemaphoreCreateMutex();
+  networkEvents = xEventGroupCreate();
+
+  // Kết nối WiFi lấy cấu hình (Chạy 1 lần trong setup)
+  Serial.println("[SETUP] Connecting to WiFi...");
   WiFi.begin(ssid, password);
-  Serial.print("Connecting");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
+    delay(500);
     Serial.print(".");
   }
-
-  Serial.println("\nWiFi Connected!");
+  Serial.println("\n[SETUP] WiFi connected!");
+  Serial.print("[SETUP] IP Address: ");
+  Serial.println(WiFi.localIP());
   HTTPClient http;
   http.begin("http://192.168.1.122:5435/house/staff?houseId=home1");
-
   if (http.GET() == 200) {
-    String payload = http.getString();
-    DynamicJsonDocument doc(8192);  // Tăng size để chứa mảng lớn
-    deserializeJson(doc, payload);
+    DynamicJsonDocument doc(8192);
+    deserializeJson(doc, http.getString());
     for (JsonObject item : doc.as<JsonArray>()) {
-
-      String kind = item["kind"].as<String>();
+      String kind = item["kind"];
       if (kind == "SENSOR") {
         SensorConfig s;
-        s.gipo = item["gipo"].as<int>();
+        s.gipo = item["gipo"];
         s.id = item["id"].as<String>();
         s.type = item["type"].as<String>();
         s.roomId = item["roomId"].as<String>();
-        s.type.trim();
-        // LỖI 2: Sửa các biến trong printf cho đúng (dùng s.id, s.gipo thay vì id, gipo)
-        Serial.println("---------------------------");
-        Serial.printf("Found [%s]: ID=%s, Pin=%d, Type=%s, Room=%s",
-                      kind.c_str(), s.id.c_str(), s.gipo, s.type.c_str(), s.roomId.c_str());
         if (s.type == "DHT11") {
           s.dhtInstance = new DHT(s.gipo, DHT11);
           s.dhtInstance->begin();
         } else {
           pinMode(s.gipo, INPUT);
         }
+        Serial.printf("  -> ID: %s | GPIO: %d | Type: %s | Room: %s\n",
+                      s.id.c_str(), s.gipo, s.type.c_str(), s.roomId.c_str());
         sensorList.push_back(s);
       } else if (kind == "DEVICE") {
         DeviceConfig d;
-        d.gipo = item["gipo"].as<int>();
+        d.gipo = item["gipo"];
         d.id = item["id"].as<String>();
-        d.status = item["status"].as<bool>();
-        d.value = item["value"].as<int>();
+        d.status = item["status"];
         d.roomId = item["roomId"].as<String>();
-        // LỖI 2: Sửa các biến trong printf cho đúng (dùng s.id, s.gipo thay vì id, gipo)
-        Serial.println("---------------------------");
-        Serial.printf("Found [%s]: ID=%s, Pin=%d , R=%s",
-                      kind.c_str(), d.id.c_str(), d.gipo,d.roomId.c_str());
+        Serial.printf("  -> ID: %s | GPIO: %d | Status: %s\n",
+                      d.id.c_str(), d.gipo, d.status ? "ON" : "OFF");
         pinMode(d.gipo, OUTPUT);
         digitalWrite(d.gipo, d.status ? HIGH : LOW);
         deviceList.push_back(d);
       }
     }
   }
-  client.setServer(mqtt_server, mqtt_port);
+  http.end();
+
+  client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
-}
 
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
+  // Tạo Task và gán vào các nhân CPU
+  // Core 0: Xử lý Network
+  xTaskCreatePinnedToCore(vTaskNetwork, "NetManager", 4096, NULL, 3, NULL, 0);
 
-  // 1. Chuyển payload thành String hoặc Json
-  String message;
-  for (int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  Serial.println(message);
-
-  // 2. Parse JSON để lấy lệnh
-  StaticJsonDocument<200> doc;
-  deserializeJson(doc, message);
-
-  bool status = doc["status"];
-  const char* target = doc["id"];  // ví dụ: "relay1"
-  bool found = false;
-  for (auto& d : deviceList) {
-    if (d.id == target) {
-      // Cập nhật trạng thái trong struct
-      d.status = status;
-
-      // Thực thi điều khiển chân GPIO
-      digitalWrite(d.gipo, d.status ? HIGH : LOW);
-
-      Serial.printf("DONE: GPIO %d set to %s\n", d.gipo, d.status ? "HIGH" : "LOW");
-      found = true;
-      break;  // Tìm thấy rồi thì thoát vòng lặp cho nhanh
-    }
-  }
-}
-
-void reconnect() {
-  while (!client.connected()) {
-    // client.connect("ID_DUY_NHAT")
-    if (client.connect("Arduino_Cua_Tui")) {
-      Serial.println("Đã kết nối Broker NestJS!");
-      // Đăng ký nhận lệnh từ NestJS
-      client.subscribe("devices");
-    } else {
-      delay(5000);
-    }
-  }
+  // Core 1: Xử lý Logic ứng dụng
+  xTaskCreatePinnedToCore(vTaskSensorCollector, "SensColl", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(vTaskMQTTProcessor, "MQTTProc", 8192, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(vTaskMonitor, "SysMon", 2048, NULL, 0, NULL, 1);
 }
 
 void loop() {
-  if (!client.connected()) reconnect();
-  client.loop();
-  for (auto& s : sensorList) {
-    // 1. Đọc dữ liệu dựa trên loại Sensor
-    std::vector<Property> newData;
-    if (s.type == "DHT11" && s.dhtInstance != NULL) {
-      float temperature = s.dhtInstance->readTemperature();
-      float humidity = s.dhtInstance->readHumidity();
-      Property temp = {
-        "temperature",
-        temperature,
-      };
-      Property humid = {
-        "humidity",
-        humidity,
-      };
-      newData.push_back(temp);
-      newData.push_back(humid);
-
-    } else {
-      // Ví dụ cảm biến lửa hoặc cảm biến khác trả về Analog
-      float analog = analogRead(s.gipo);
-      Property ana = {
-        "analog",
-        analog,
-      };
-      newData.push_back(ana);
-    }
-    processSensorData(s, newData);
-  }
+  // Không làm gì cả, Task loop sẽ bị xóa để tiết kiệm tài nguyên
+  vTaskDelete(NULL);
 }
